@@ -16,8 +16,7 @@ app = FastAPI(title="AI Writing Assistant")
 # LOAD MODELS (once, at server startup — not per request)
 # ============================================================
 
-MODEL_PATH = "../models/paraphraser-v4"
-
+MODEL_PATH = "../models/paraphraser-v6"
 print("Loading paraphrasing model...")
 tokenizer = T5Tokenizer.from_pretrained(MODEL_PATH)
 model = T5ForConditionalGeneration.from_pretrained(MODEL_PATH)
