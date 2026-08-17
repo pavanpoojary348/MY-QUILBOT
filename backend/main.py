@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from transformers import T5Tokenizer, T5ForConditionalGeneration
+from transformers import T5Tokenizer, T5ForConditionalGeneration, pipeline
 from sentence_transformers import SentenceTransformer, util
+from nltk.corpus import wordnet
 import re
 
 
@@ -17,6 +18,7 @@ app = FastAPI(title="AI Writing Assistant")
 # ============================================================
 
 MODEL_PATH = "../models/paraphraser-v6"
+
 print("Loading paraphrasing model...")
 tokenizer = T5Tokenizer.from_pretrained(MODEL_PATH)
 model = T5ForConditionalGeneration.from_pretrained(MODEL_PATH)
@@ -24,11 +26,33 @@ model = T5ForConditionalGeneration.from_pretrained(MODEL_PATH)
 print("Loading semantic similarity model...")
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
+print("Loading contextual synonym model...")
+fill_mask = pipeline("fill-mask", model="bert-base-uncased")
+
 print("Models loaded successfully.")
 
 
 # ============================================================
-# HELPER FUNCTIONS (from paraphrase_final.py)
+# SENTENCE SPLITTING
+# ============================================================
+
+ABBREVIATIONS = [
+    "Dr", "Mr", "Mrs", "Ms", "Jr", "Sr", "Prof",
+    "vs", "etc", "e.g", "i.e", "U.S", "U.K", "U.N",
+    "Inc", "Ltd", "Co", "St",
+]
+
+def split_sentences(text):
+    protected = text
+    for abbr in ABBREVIATIONS:
+        protected = re.sub(rf'\b{re.escape(abbr)}\.', f'{abbr}<PERIOD>', protected)
+    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', protected.strip())
+    sentences = [s.replace('<PERIOD>', '.').strip() for s in sentences]
+    return [s for s in sentences if s]
+
+
+# ============================================================
+# HELPER FUNCTIONS
 # ============================================================
 
 def word_overlap(a, b):
@@ -45,10 +69,6 @@ def semantic_similarity(a, b):
 
 
 def introduces_new_entities(original, candidate):
-    """
-    Returns True if the candidate contains capitalized words
-    (proper nouns) or numbers that don't appear in the original.
-    """
     def extract_entities(text):
         words = text.split()
         proper_nouns = set()
@@ -109,6 +129,48 @@ def paraphrase(sentence, num_candidates=8):
 
 
 # ============================================================
+# SYNONYM LOOKUP (WordNet + BERT contextual re-ranking)
+# ============================================================
+
+def get_wordnet_candidates(word):
+    candidates = set()
+    for syn in wordnet.synsets(word):
+        for lemma in syn.lemmas():
+            name = lemma.name().replace('_', ' ')
+            if name.lower() != word.lower() and ' ' not in name:
+                candidates.add(name.lower())
+    return candidates
+
+
+def get_contextual_synonyms(sentence, target_word, max_results=5):
+    """
+    Uses WordNet to generate candidate synonyms, then re-ranks them
+    using BERT's masked-language-model predictions for the target
+    word's position in THIS specific sentence — filters out synonyms
+    that are technically valid in isolation but don't fit the context
+    (e.g. "felicitous" for "happy" in "I am very happy").
+    """
+    masked_sentence = re.sub(
+        rf'\b{re.escape(target_word)}\b',
+        '[MASK]',
+        sentence,
+        count=1,
+        flags=re.IGNORECASE
+    )
+
+    candidates = get_wordnet_candidates(target_word)
+    if not candidates:
+        return []
+
+    predictions = fill_mask(masked_sentence, top_k=100)
+    bert_ranked_words = {p['token_str'].strip().lower(): p['score'] for p in predictions}
+
+    scored = [(c, bert_ranked_words.get(c, 0.0)) for c in candidates]
+    scored.sort(key=lambda x: -x[1])
+    return [w for w, s in scored[:max_results] if s > 0]
+
+
+# ============================================================
 # ROUTES
 # ============================================================
 
@@ -116,6 +178,8 @@ def paraphrase(sentence, num_candidates=8):
 def root():
     return {"status": "AI Writing Assistant backend is running"}
 
+
+# --- Single sentence ---
 
 class ParaphraseRequest(BaseModel):
     text: str
@@ -134,4 +198,57 @@ def paraphrase_endpoint(request: ParaphraseRequest):
         original=request.text,
         paraphrased=result,
         confident=confident,
+    )
+
+
+# --- Full paragraph ---
+
+class ParagraphRequest(BaseModel):
+    text: str
+
+
+class SentenceResult(BaseModel):
+    original: str
+    paraphrased: str
+    confident: bool
+
+
+class ParagraphResponse(BaseModel):
+    original: str
+    paraphrased: str
+    sentences: list[SentenceResult]
+
+
+@app.post("/paraphrase-paragraph", response_model=ParagraphResponse)
+def paraphrase_paragraph_endpoint(request: ParagraphRequest):
+    sentences = split_sentences(request.text)
+    results = []
+    for s in sentences:
+        paraphrased, confident = paraphrase(s)
+        results.append(SentenceResult(original=s, paraphrased=paraphrased, confident=confident))
+    full_output = " ".join(r.paraphrased for r in results)
+    return ParagraphResponse(
+        original=request.text,
+        paraphrased=full_output,
+        sentences=results,
+    )
+
+
+# --- Synonym lookup (context-aware) ---
+
+class SynonymRequest(BaseModel):
+    text: str
+    word: str
+
+
+class SynonymResponse(BaseModel):
+    word: str
+    synonyms: list[str]
+
+
+@app.post("/synonyms", response_model=SynonymResponse)
+def synonyms_endpoint(request: SynonymRequest):
+    return SynonymResponse(
+        word=request.word,
+        synonyms=get_contextual_synonyms(request.text, request.word),
     )
