@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from transformers import T5Tokenizer, T5ForConditionalGeneration, pipeline
 from sentence_transformers import SentenceTransformer, util
@@ -12,6 +13,13 @@ import re
 
 app = FastAPI(title="AI Writing Assistant")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # ============================================================
 # LOAD MODELS (once, at server startup — not per request)
@@ -22,7 +30,19 @@ MODEL_PATH = "../models/paraphraser-v6"
 print("Loading paraphrasing model...")
 tokenizer = T5Tokenizer.from_pretrained(MODEL_PATH)
 model = T5ForConditionalGeneration.from_pretrained(MODEL_PATH)
+# ============================================================
+# LOAD GRAMMAR CORRECTION MODEL
+# ============================================================
 
+GRAMMAR_MODEL_PATH = "vennify/t5-base-grammar-correction"
+
+print("Loading grammar correction model...")
+grammar_tokenizer = T5Tokenizer.from_pretrained(GRAMMAR_MODEL_PATH)
+grammar_model = T5ForConditionalGeneration.from_pretrained(
+    GRAMMAR_MODEL_PATH
+)
+
+print("Grammar model loaded successfully.")
 print("Loading semantic similarity model...")
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -126,7 +146,42 @@ def paraphrase(sentence, num_candidates=8):
     if result:
         return result[0], True
     return sentence, False
+# ============================================================
+# GRAMMAR CORRECTION
+# ============================================================
 
+def correct_grammar(text):
+    """
+    Corrects grammatical errors while trying to preserve
+    the original meaning and wording.
+    """
+
+    if not text or not text.strip():
+        return "", False
+
+    input_text = "grammar: " + text
+
+    input_ids = grammar_tokenizer(
+        input_text,
+        return_tensors="pt"
+    ).input_ids
+
+    output_ids = grammar_model.generate(
+        input_ids,
+        max_length=256,
+        num_beams=5
+    )
+
+    corrected = grammar_tokenizer.decode(
+        output_ids[0],
+        skip_special_tokens=True
+    )
+
+    overlap = word_overlap(text, corrected)
+
+    confident = overlap >= 0.5
+
+    return corrected, confident
 
 # ============================================================
 # SYNONYM LOOKUP (WordNet + BERT contextual re-ranking)
@@ -251,4 +306,30 @@ def synonyms_endpoint(request: SynonymRequest):
     return SynonymResponse(
         word=request.word,
         synonyms=get_contextual_synonyms(request.text, request.word),
+    )
+# ============================================================
+# GRAMMAR CORRECTION ENDPOINT
+# ============================================================
+
+class GrammarRequest(BaseModel):
+    text: str
+
+
+class GrammarResponse(BaseModel):
+    original: str
+    corrected: str
+    confident: bool
+
+
+@app.post("/grammar", response_model=GrammarResponse)
+def grammar_endpoint(request: GrammarRequest):
+
+    corrected, confident = correct_grammar(
+        request.text
+    )
+
+    return GrammarResponse(
+        original=request.text,
+        corrected=corrected if request.text.strip() else request.text,
+        confident=confident,
     )
